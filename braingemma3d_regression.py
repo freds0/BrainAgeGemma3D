@@ -26,10 +26,12 @@ os.environ["TRANSFORMERS_NO_TF"] = "1"
 os.environ["USE_TF"] = "0"
 
 import argparse
+import time
 
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from braingemma3d_architecture import MedSigLIP3D
 from braingemma3d_age_dataset import OpenBHBAgeDataset
@@ -161,14 +163,16 @@ def evaluate(model, loader, device, age_std, age_mean):
     model.eval()
     abs_err = 0.0
     n = 0
+    bar = tqdm(loader, desc="  eval", leave=False, unit="batch")
     with torch.no_grad():
-        for vol, age in loader:
+        for vol, age in bar:
             vol = vol.to(device)
             pred = model(vol).cpu()
             pred_years = pred * age_std + age_mean
             true_years = age * age_std + age_mean
             abs_err += (pred_years - true_years).abs().sum().item()
             n += age.numel()
+            bar.set_postfix(MAE=f"{abs_err / max(n, 1):.2f}yr")
     return abs_err / max(n, 1)
 
 
@@ -210,8 +214,16 @@ def train(args):
     if args.resume:
         load_regressor(model, args.resume, map_location=device)
 
-    n_train = sum(p.numel() for p in model.trainable_parameters())
-    print(f"[model] trainable params: {n_train/1e6:.3f}M")
+    n_train_p = sum(p.numel() for p in model.trainable_parameters())
+    n_total_p = sum(p.numel() for p in model.parameters())
+    print("=" * 60)
+    print(f"[setup] device={device} | modality={args.modality} | loss={args.loss}")
+    print(f"[setup] train={len(train_ds)} vols  test={len(test_ds)} vols  "
+          f"batch={args.batch_size}  steps/epoch={len(train_loader)}")
+    print(f"[setup] trainable={n_train_p/1e6:.3f}M / {n_total_p/1e6:.3f}M "
+          f"({100*n_train_p/max(n_total_p,1):.2f}%)  "
+          f"| lora={args.use_lora} encoder_frozen={not args.unfreeze_encoder}")
+    print("=" * 60)
 
     # MAE (L1) by default; swap to nn.MSELoss() for MSE.
     criterion = nn.MSELoss() if args.loss == "mse" else nn.L1Loss()
@@ -219,12 +231,15 @@ def train(args):
                               weight_decay=args.weight_decay)
 
     best_mae = float("inf")
+    best_epoch = 0
     for ep in range(1, args.epochs + 1):
         model.train()
         if not args.unfreeze_encoder:
             model.encoder.eval()  # keep frozen BN/LN stats stable
         run = 0.0
-        for i, (vol, age) in enumerate(train_loader):
+        t0 = time.perf_counter()
+        bar = tqdm(train_loader, desc=f"epoch {ep}/{args.epochs}", unit="batch")
+        for i, (vol, age) in enumerate(bar):
             vol, age = vol.to(device), age.to(device)
             pred = model(vol)
             loss = criterion(pred, age) / args.grad_accum
@@ -233,18 +248,26 @@ def train(args):
                 optim.step()
                 optim.zero_grad()
             run += loss.item() * args.grad_accum
+            bar.set_postfix(loss=f"{run/(i+1):.4f}",
+                            lr=f"{optim.param_groups[0]['lr']:.2e}")
         train_loss = run / max(len(train_loader), 1)
+        train_dt = time.perf_counter() - t0
 
         mae = evaluate(model, test_loader, device, age_std, age_mean)
+        is_best = mae < best_mae
         print(f"epoch {ep}/{args.epochs} | train_{args.loss}={train_loss:.4f} "
-              f"| test_MAE={mae:.3f} yr")
+              f"| test_MAE={mae:.3f} yr | {train_dt:.1f}s"
+              f"{'  <- best' if is_best else ''}")
 
-        if mae < best_mae:
+        if is_best:
             best_mae = mae
+            best_epoch = ep
             save_regressor(model, args.output_dir,
                            extra={"age_mean": age_mean, "age_std": age_std,
                                   "epoch": ep, "mae": mae})
-    print(f"\nBest test MAE: {best_mae:.3f} years")
+    print("=" * 60)
+    print(f"Best test MAE: {best_mae:.3f} years (epoch {best_epoch}) "
+          f"-> {args.output_dir}/regressor.pt")
 
 
 def build_argparser():
