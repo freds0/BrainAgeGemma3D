@@ -175,17 +175,24 @@ def evaluate(model, loader, device, age_std, age_mean):
 def train(args):
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
+    # Train and test may live under the same root (full Open-BHB) or under two
+    # separate sample dirs (openbhb_train_sample / openbhb_test_sample), in which
+    # case --test-root points at the second one.
+    test_root = args.test_root or args.root
     age_mean, age_std = OpenBHBAgeDataset.compute_age_stats(args.root, "train")
     print(f"[data] age_mean={age_mean:.2f} age_std={age_std:.2f}")
 
     train_ds = OpenBHBAgeDataset(args.root, "train", args.modality,
                                  target_size=tuple(args.target_size),
                                  age_mean=age_mean, age_std=age_std)
-    test_ds = OpenBHBAgeDataset(args.root, "test", args.modality,
+    test_ds = OpenBHBAgeDataset(test_root, "test", args.modality,
                                 target_size=tuple(args.target_size),
                                 age_mean=age_mean, age_std=age_std)
+
+    drop_last = len(train_ds) >= 2 * args.batch_size
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
-                              num_workers=args.num_workers, pin_memory=True, drop_last=True)
+                              num_workers=args.num_workers, pin_memory=True,
+                              drop_last=drop_last)
     test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False,
                              num_workers=args.num_workers, pin_memory=True)
 
@@ -242,7 +249,11 @@ def train(args):
 
 def build_argparser():
     ap = argparse.ArgumentParser(description="BrainGemma3D brain-age regression")
-    ap.add_argument("--root", default="/media/fred/FRED5TB/Einstein/Open_BHB_processado")
+    ap.add_argument("--root", default="/media/fred/FRED5TB/Einstein/Open_BHB_processado",
+                    help="Train root: has train.tsv and train/<modality>/")
+    ap.add_argument("--test-root", default=None,
+                    help="Test root if separate from --root (has test.tsv and "
+                         "test/<modality>/). Defaults to --root.")
     ap.add_argument("--vision-model-dir", required=True,
                     help="Local MedSigLIP/SigLIP dir or HF hub id (e.g. google/medsiglip-448)")
     ap.add_argument("--model-cache", default="models",
