@@ -413,10 +413,62 @@ def train(args):
         args.stage = "full"
     elif args.use_lora:
         args.stage = "lora"
+    if args.stage == "full" and args.lr > 2e-5:
+        print(
+            f"[warning] lr={args.lr:.2e} is high for full encoder fine-tuning; "
+            "1e-5 is recommended."
+        )
 
     train_frame = OpenBHBAgeDataset.load_metadata(args.root, "train", args.modality)
     test_root = args.test_root or args.root
     test_frame = OpenBHBAgeDataset.load_metadata(test_root, "test", args.modality)
+
+    if args.preflight_volumes:
+        invalid = OpenBHBAgeDataset.inspect_volumes(
+            args.root, "train", args.modality, train_frame
+        )
+        invalid += OpenBHBAgeDataset.inspect_volumes(
+            test_root, "test", args.modality, test_frame
+        )
+        if invalid:
+            output_dir = Path(args.output_dir)
+            output_dir.mkdir(parents=True, exist_ok=True)
+            report_path = output_dir / "invalid_volumes.json"
+            with open(report_path, "w", encoding="utf-8") as handle:
+                json.dump(invalid, handle, indent=2)
+            print(f"[preflight] {len(invalid)} invalid volumes -> {report_path}")
+            if args.invalid_volume_policy == "error":
+                examples = "\n".join(
+                    f"  {item['participant_id']}: {item['error']}"
+                    for item in invalid[:10]
+                )
+                raise ValueError(
+                    f"Invalid volumes found before training:\n{examples}\n"
+                    "Use --invalid-volume-policy drop to exclude them or "
+                    "sanitize to replace non-finite voxels."
+                )
+            if args.invalid_volume_policy == "drop":
+                invalid_train = {
+                    item["participant_id"]
+                    for item in invalid
+                    if item["split"] == "train"
+                }
+                invalid_test = {
+                    item["participant_id"]
+                    for item in invalid
+                    if item["split"] == "test"
+                }
+                train_frame = train_frame[
+                    ~train_frame.participant_id.isin(invalid_train)
+                ].reset_index(drop=True)
+                test_frame = test_frame[
+                    ~test_frame.participant_id.isin(invalid_test)
+                ].reset_index(drop=True)
+                print(
+                    f"[preflight] dropped {len(invalid_train)} train and "
+                    f"{len(invalid_test)} test participants"
+                )
+
     overlap = set(train_frame.participant_id) & set(test_frame.participant_id)
     if overlap:
         raise ValueError(f"Data leakage: {len(overlap)} IDs overlap train and test")
@@ -427,6 +479,9 @@ def train(args):
 
     common = dict(
         modality=args.modality,
+        invalid_volume_policy=(
+            "sanitize" if args.invalid_volume_policy == "sanitize" else "error"
+        ),
         target_size=tuple(args.target_size),
         age_mean=age_mean,
         age_std=age_std,
@@ -679,6 +734,18 @@ def build_argparser():
     parser.add_argument("--patience", type=int, default=8)
     parser.add_argument("--min-delta", type=float, default=0.01)
     parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument(
+        "--preflight-volumes",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Scan every volume for shape/read/non-finite errors before training",
+    )
+    parser.add_argument(
+        "--invalid-volume-policy",
+        choices=["error", "drop", "sanitize"],
+        default="error",
+        help="How preflight and loading handle invalid volumes",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--fp16", action="store_true", help="Force FP16 instead of BF16"

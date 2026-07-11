@@ -381,6 +381,14 @@ ssh -L 6006:localhost:6006 user@training-server
 
 Then open `http://localhost:6006`.
 
+#### Invalid Open-BHB volumes
+
+Before building the split, the trainer scans every selected train and test volume for read errors, dimensionality, `NaN`, and infinity. Findings are written to `<output-dir>/invalid_volumes.json`. The default `--invalid-volume-policy error` stops before epoch 1. Use `--invalid-volume-policy drop` to exclude affected participants explicitly; `sanitize` replaces non-finite voxels and should only be used with a documented scientific justification.
+
+If a non-finite volume first appears after several complete epochs, investigate concurrent preprocessing, file replacement, or storage corruption: every training participant is normally read once per epoch. Restarting from a checkpoint after changing the participant set also changes the experiment; start a fresh run for the final reported result.
+
+For `--stage full`, use `--lr 1e-5` as the initial learning rate. The generic `1e-4` default is intended for the regression head and is aggressive for the complete vision encoder.
+
 #### CUDA launch failures
 
 Do not use large image batches for 3D attention. For example, `--batch-size 512 --grad-accum 8` attempts 512 volumes concurrently and an effective batch of 4096; it can trigger a driver-level `cudaErrorLaunchFailure`. Start with `--batch-size 1 --grad-accum 8`. The trainer rejects batches above 16 unless `--allow-large-batch` is explicitly supplied.

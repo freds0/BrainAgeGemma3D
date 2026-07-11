@@ -11,12 +11,27 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset
 
 
-def _robust_normalize(vol: np.ndarray) -> np.ndarray:
-    """Scale a finite volume to [0, 1] using its 1st-99th percentiles."""
+def _robust_normalize(vol: np.ndarray, invalid_policy: str = "error") -> np.ndarray:
+    """Scale a volume to [0, 1], optionally repairing non-finite voxels."""
     if vol.ndim != 3:
         raise ValueError(f"Expected a 3D volume, got shape={vol.shape}")
-    if not np.isfinite(vol).all():
-        raise ValueError("Volume contains NaN or infinite values")
+    finite = np.isfinite(vol)
+    if not finite.all():
+        if invalid_policy != "sanitize":
+            raise ValueError(
+                f"Volume contains {(~finite).sum()} NaN or infinite voxels"
+            )
+        if finite.any():
+            finite_values = vol[finite]
+            replacement = float(np.median(finite_values))
+            vol = np.nan_to_num(
+                vol,
+                nan=replacement,
+                posinf=float(finite_values.max()),
+                neginf=float(finite_values.min()),
+            )
+        else:
+            vol = np.zeros_like(vol, dtype=np.float32)
     vmin, vmax = np.percentile(vol, (1, 99))
     if vmax <= vmin:
         return np.zeros_like(vol, dtype=np.float32)
@@ -36,6 +51,7 @@ class OpenBHBAgeDataset(Dataset):
         age_std: Optional[float] = None,
         participant_ids: Optional[Iterable[str]] = None,
         return_metadata: bool = False,
+        invalid_volume_policy: str = "error",
     ):
         self.root = Path(root)
         self.split = split
@@ -46,6 +62,7 @@ class OpenBHBAgeDataset(Dataset):
         self.age_mean = age_mean
         self.age_std = age_std
         self.return_metadata = return_metadata
+        self.invalid_volume_policy = invalid_volume_policy
 
         if age_std is not None and (not np.isfinite(age_std) or age_std <= 0):
             raise ValueError(f"age_std must be positive and finite, got {age_std}")
@@ -101,6 +118,41 @@ class OpenBHBAgeDataset(Dataset):
         return df[have].reset_index(drop=True)
 
     @staticmethod
+    def inspect_volumes(root: str, split: str, modality: str, frame: pd.DataFrame):
+        """Return records for unreadable, non-3D, or non-finite volumes."""
+        volume_dir = Path(root) / split / modality
+        suffix = f"_{modality}.npy"
+        invalid = []
+        total = len(frame)
+        for position, participant_id in enumerate(
+            frame["participant_id"].astype(str), 1
+        ):
+            path = volume_dir / f"{participant_id}{suffix}"
+            try:
+                volume = np.load(path, mmap_mode="r")
+                if volume.ndim != 3:
+                    raise ValueError(f"expected 3 dimensions, got {volume.shape}")
+                nonfinite = int((~np.isfinite(volume)).sum())
+                if nonfinite:
+                    raise ValueError(f"{nonfinite} NaN/Inf voxels")
+            except Exception as error:
+                invalid.append(
+                    {
+                        "participant_id": participant_id,
+                        "split": split,
+                        "path": str(path),
+                        "error": str(error),
+                    }
+                )
+            if position % 250 == 0 or position == total:
+                print(
+                    f"[preflight] {split}/{modality}: {position}/{total} "
+                    f"checked, {len(invalid)} invalid",
+                    end="\r" if position < total else "\n",
+                )
+        return invalid
+
+    @staticmethod
     def compute_age_stats(
         root: str,
         split: str = "train",
@@ -126,7 +178,13 @@ class OpenBHBAgeDataset(Dataset):
     def __getitem__(self, index):
         row = self.frame.iloc[index]
         path = self.dir / f"{row.participant_id}{self.suffix}"
-        vol = _robust_normalize(np.load(path).astype(np.float32, copy=False))
+        try:
+            raw = np.load(path).astype(np.float32, copy=False)
+            vol = _robust_normalize(raw, self.invalid_volume_policy)
+        except Exception as error:
+            raise ValueError(
+                f"Invalid volume for participant {row.participant_id}: {path}: {error}"
+            ) from error
         vol_t = torch.from_numpy(vol)[None, None]
         vol_t = (
             F.interpolate(
