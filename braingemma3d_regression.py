@@ -35,6 +35,59 @@ def seed_worker(worker_id: int):
     np.random.seed(seed)
 
 
+class ExperimentLogger:
+    """Mirror scalar metrics to TensorBoard and Weights & Biases."""
+
+    def __init__(self, args):
+        self.writer = None
+        self.wandb = None
+        output_dir = Path(args.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        if args.tensorboard:
+            from torch.utils.tensorboard import SummaryWriter
+
+            log_dir = Path(args.tensorboard_dir or output_dir / "tensorboard")
+            self.writer = SummaryWriter(log_dir=str(log_dir))
+            self.writer.add_text(
+                "config", json.dumps(vars(args), indent=2, default=str), 0
+            )
+            print(f"[tensorboard] logs -> {log_dir}")
+        if args.wandb:
+            try:
+                import wandb
+            except ImportError as error:
+                raise RuntimeError(
+                    "W&B logging requested; install it with: pip install wandb"
+                ) from error
+            self.wandb = wandb
+            wandb.init(
+                project=args.wandb_project,
+                entity=args.wandb_entity,
+                name=args.wandb_run_name,
+                id=args.wandb_run_id,
+                resume="allow" if args.wandb_run_id else None,
+                mode=args.wandb_mode,
+                dir=str(output_dir),
+                config=vars(args),
+            )
+            print(f"[wandb] mode={args.wandb_mode} project={args.wandb_project}")
+
+    def log(self, metrics, step):
+        clean = {key: float(value) for key, value in metrics.items()}
+        if self.writer is not None:
+            for key, value in clean.items():
+                self.writer.add_scalar(key, value, step)
+        if self.wandb is not None:
+            self.wandb.log(clean, step=step)
+
+    def close(self):
+        if self.writer is not None:
+            self.writer.flush()
+            self.writer.close()
+        if self.wandb is not None:
+            self.wandb.finish()
+
+
 def resolve_vision_model_dir(spec: str, cache_root: str = "models") -> str:
     if os.path.isdir(spec):
         return spec
@@ -392,6 +445,9 @@ def train(args):
         start_epoch = int(payload.get("epoch", 0)) + 1
         best_val = float(payload.get("best_val_mae", float("inf")))
 
+    logger = ExperimentLogger(args)
+    global_step = max(0, scheduler.last_epoch)
+
     print("=" * 72)
     print(f"device={device} amp={amp_dtype} stage={args.stage} loss={args.loss}")
     print(
@@ -439,6 +495,14 @@ def train(args):
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
                 scheduler.step()
+                global_step += 1
+                logger.log(
+                    {
+                        "train/batch_loss": raw_loss.item(),
+                        "train/learning_rate": scheduler.get_last_lr()[0],
+                    },
+                    global_step,
+                )
             running += raw_loss.item() * age.numel()
             seen += age.numel()
             bar.set_postfix(
@@ -451,6 +515,14 @@ def train(args):
             f"epoch={epoch} train_loss={running/max(seen, 1):.4f} time={time.perf_counter()-started:.1f}s val",
             val_metrics,
         )
+        epoch_log = {"train/epoch_loss": running / max(seen, 1)}
+        epoch_log.update(
+            {
+                f"validation/{key}": val_metrics[key]
+                for key in ("mae", "rmse", "r2", "pearson", "spearman", "mean_delta")
+            }
+        )
+        logger.log(epoch_log, global_step)
         improved = val_metrics["mae"] < best_val - args.min_delta
         if improved:
             best_val, stale_epochs = val_metrics["mae"], 0
@@ -483,6 +555,13 @@ def train(args):
     load_checkpoint(best_path, model)
     test_metrics = evaluate(model, test_loader, device, age_mean, age_std, amp_dtype)
     print_metrics("FINAL TEST", test_metrics)
+    logger.log(
+        {
+            f"test/{key}": test_metrics[key]
+            for key in ("mae", "rmse", "r2", "pearson", "spearman", "mean_delta")
+        },
+        global_step + 1,
+    )
     print_subgroup_metrics(test_metrics)
     results = {
         key: value
@@ -495,6 +574,7 @@ def train(args):
         Path(args.output_dir) / "test_metrics.json", "w", encoding="utf-8"
     ) as handle:
         json.dump(results, handle, indent=2)
+    logger.close()
 
 
 def build_argparser():
@@ -544,6 +624,16 @@ def build_argparser():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--fp16", action="store_true", help="Force FP16 instead of BF16"
+    )
+    parser.add_argument("--tensorboard", action="store_true")
+    parser.add_argument("--tensorboard-dir", default=None)
+    parser.add_argument("--wandb", action="store_true")
+    parser.add_argument("--wandb-project", default="braingemma3d-brain-age")
+    parser.add_argument("--wandb-entity", default=None)
+    parser.add_argument("--wandb-run-name", default=None)
+    parser.add_argument("--wandb-run-id", default=None)
+    parser.add_argument(
+        "--wandb-mode", choices=["online", "offline", "disabled"], default="online"
     )
     return parser
 

@@ -171,8 +171,8 @@ BrainGemma3D/
 |------|---------|
 | `braingemma3d_architecture.py` | Defines the BrainGemma3D model: 3D vision encoder (inflated SigLIP), token compressor, projector, and quantized MedGemma LM. Includes NIfTI loading utilities. |
 | `braingemma3d_training.py` | Complete three-stage training pipeline: contrastive grounding → projector warmup → LoRA adaptation. Handles balanced datasets (BraTS + healthy controls) with group-based splits. |
-| `braingemma3d_regression.py` | Brain-age prediction training script. Reuses the inflated 3D MedSigLIP encoder and attaches an MLP regression head; the MedGemma language model is not loaded for this image-regression task. |
-| `braingemma3d_age_dataset.py` | PyTorch dataset for preprocessed Open-BHB `.npy` volumes with age labels from `train.tsv` and `test.tsv`. |
+| `braingemma3d_regression.py` | Leakage-safe Open-BHB brain-age training with train/validation model selection, held-out test evaluation, staged encoder adaptation, AMP, early stopping, resumable checkpoints, and subgroup metrics. |
+| `braingemma3d_age_dataset.py` | Validated Open-BHB `.npy` loader with participant filtering, finite-value checks, robust per-volume normalization, resizing, target standardization, and optional sex/site metadata. |
 | `braingemma3d_inference.py` | Generate radiology reports from trained checkpoints. Supports single-volume, batch, and quick-test modes. |
 | `braingemma3d_evaluation.py` | Compute NLG metrics (BLEU/ROUGE/METEOR/CIDEr/BERTScore) and clinical F1 scores (Laterality/Anatomy/Pathology) on the test set. |
 | `braingemma3d_evaluation_ablation.py` | Evaluate checkpoints from each training stage to measure the contribution of contrastive grounding, projector warmup, and LoRA. |
@@ -204,34 +204,89 @@ huggingface-cli download google/medsiglip-448 --local-dir Models/siglip
 huggingface-cli download google/medgemma-1.5-4b-it --local-dir Models/medgemma
 ```
 
-### 3. Training (Three Stages)
+### 3. Report-Generation Training (Three Phases)
+
+This pipeline trains on BraTS/TextBraTS plus optional healthy controls. It is separate from Open-BHB brain-age regression. `--base-dir` must contain the following resources:
+
+```text
+<base-dir>/
+├── Models/siglip/
+├── Models/medgemma/
+└── Datasets/
+    ├── BraTS2020_TrainingData/MICCAI_BraTS2020_TrainingData/
+    ├── TextBraTS/TextBraTSData/
+    └── HealthyBrains_Preprocessed/
+```
+
+All three phases run by default. Use one command for the complete pipeline:
 
 ```bash
-# Stage 1: Contrastive Grounding
 python braingemma3d_training.py \
-    --base-dir /path/to/data \
-    --run-phase1 \
+    --base-dir /path/to/resources \
+    --experiment-name exp1 \
+    --checkpoint-dir checkpoints \
+    --output-dir outputs \
     --phase1-epochs 10 \
-    --output-dir checkpoints/exp1
-
-# Stage 2A: Projector Warmup
-python braingemma3d_training.py \
-    --base-dir /path/to/data \
-    --load-from checkpoints/exp1/phase1_alignment \
-    --run-phase2A \
-    --phase2A-epochs 5
-
-# Stage 2B: LoRA Adaptation
-python braingemma3d_training.py \
-    --base-dir /path/to/data \
-    --load-from checkpoints/exp1/phase2a_warmup \
-    --run-phase2B \
-    --phase2B-epochs 5
+    --phase2a-epochs 5 \
+    --phase2b-epochs 5
 ```
+
+To run phases separately, disable the phases that should not execute and load the preceding checkpoint:
+
+```bash
+# Phase 1 only
+python braingemma3d_training.py \
+    --base-dir /path/to/resources \
+    --experiment-name exp1 \
+    --checkpoint-dir checkpoints \
+    --output-dir outputs \
+    --phase1-epochs 10 \
+    --skip-phase2a --skip-phase2b
+
+# Phase 2A only
+python braingemma3d_training.py \
+    --base-dir /path/to/resources \
+    --experiment-name exp1_phase2a \
+    --load-checkpoint checkpoints/exp1/phase1_alignment \
+    --checkpoint-dir checkpoints \
+    --output-dir outputs \
+    --phase2a-epochs 5 \
+    --skip-phase1 --skip-phase2b
+
+# Phase 2B only
+python braingemma3d_training.py \
+    --base-dir /path/to/resources \
+    --experiment-name exp1_phase2b \
+    --load-checkpoint checkpoints/exp1_phase2a/phase2a_projector \
+    --checkpoint-dir checkpoints \
+    --output-dir outputs \
+    --phase2b-epochs 5 \
+    --skip-phase1 --skip-phase2a
+```
+
+The valid phase controls are `--skip-phase1`, `--skip-phase2a`, and `--skip-phase2b`; there are no `--run-phase*` flags.
 
 ### 4. Brain Age Prediction Training
 
-The brain-age path uses only the inflated 3D MedSigLIP encoder and an MLP regression head. The original `test.tsv` is held out and evaluated once after model selection. A deterministic 90/10 train-validation split is stratified by site, age band, and sex.
+> **Important:** Open-BHB brain-age experiments must use `braingemma3d_regression.py`. The `braingemma3d_training.py` entry point is exclusively for BraTS/TextBraTS report generation and will look for the BraTS directory tree.
+
+The brain-age path uses only the inflated 3D MedSigLIP encoder and an MLP regression head; MedGemma is not loaded. The original `test.tsv` is held out and evaluated once after model selection. A deterministic 90/10 train-validation split is stratified by site, age band, and sex.
+
+Expected Open-BHB layout:
+
+```text
+Open_BHB_processado/
+├── train.tsv
+├── test.tsv
+├── train/
+│   ├── quasiraw_3d/<participant_id>_quasiraw_3d.npy
+│   └── vbm_3d/<participant_id>_vbm_3d.npy
+└── test/
+    ├── quasiraw_3d/<participant_id>_quasiraw_3d.npy
+    └── vbm_3d/<participant_id>_vbm_3d.npy
+```
+
+Required TSV columns are `participant_id` and `age`; `sex` and `site` enable stratification and subgroup reporting. The loader rejects duplicate IDs, invalid ages, non-finite volumes, and train/test participant overlap.
 
 Run a dataset check:
 
@@ -242,26 +297,48 @@ python braingemma3d_age_dataset.py \
     --split train
 ```
 
-Train the memory-safe head-only baseline (recommended first run for a 12 GB GPU):
+Create `run_train.sh` for the memory-safe head-only baseline (recommended first run for a 12 GB GPU):
 
 ```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
 python braingemma3d_regression.py \
-    --root /path/to/Open_BHB_processado \
-    --vision-model-dir google/medsiglip-448 \
+    --root /root/DATASETS/openbhb_data \
+    --vision-model-dir /root/Models/siglip \
+    --modality quasiraw_3d \
     --stage head \
     --target-size 32 112 112 \
-    --depth 4 --depth-stride 4 --max-depth-patches 8 \
-    --batch-size 1 --grad-accum 8 \
-    --output-dir checkpoints/brainage_head
+    --depth 4 \
+    --depth-stride 4 \
+    --max-depth-patches 8 \
+    --batch-size 1 \
+    --grad-accum 8 \
+    --epochs 30 \
+    --lr 1e-4 \
+    --output-dir checkpoints/brainage_head \
+    --tensorboard \
+    --tensorboard-dir checkpoints/brainage_head/tensorboard \
+    --wandb \
+    --wandb-project braingemma3d-brain-age \
+    --wandb-run-name head-seed42
 ```
 
-After validating the baseline, adapt the inflated stem or add LoRA adapters:
+Run it with `bash run_train.sh`. Replace `/root/Models/siglip` with `google/medsiglip-448` to download from Hugging Face when authentication and network access are available.
+
+Available training stages:
+
+| Stage | Trainable components | Recommended use |
+|---|---|---|
+| `head` | Regression head | First baseline; lowest memory use |
+| `stem` | 3D patch stem + regression head | Adapt inflated MRI input projection |
+| `lora` | 3D patch stem + q/v LoRA + head | Parameter-efficient encoder adaptation |
+| `full` | Full vision encoder + head | Large-memory experiments only |
+
+Examples:
 
 ```bash
-# Train the 3D patch stem and head
 python braingemma3d_regression.py ... --stage stem --lr 1e-5
-
-# Train the stem, head, and q/v LoRA adapters
 python braingemma3d_regression.py ... --stage lora --lr 1e-5
 ```
 
@@ -277,7 +354,34 @@ checkpoints/brainage_head/last.pt         # resumable latest epoch
 checkpoints/brainage_head/test_metrics.json
 ```
 
-Resume with `--resume checkpoints/brainage_head/last.pt`. The checkpoint includes model, optimizer, scheduler, RNG state, normalization statistics, epoch, and arguments. Test metrics include MAE, RMSE, R2, Pearson, Spearman, mean brain-age delta, and subgroup summaries.
+Resume an interrupted run with the same stage and architecture using `--resume checkpoints/brainage_head/last.pt`. The checkpoint includes model, optimizer, scheduler, RNG state, normalization statistics, epoch, and arguments. Test metrics include MAE, RMSE, R2, Pearson, Spearman, mean brain-age delta, and subgroup summaries.
+
+#### TensorBoard and Weights & Biases
+
+Both loggers can run together and receive the same training, validation, learning-rate, and final-test scalars. Authenticate W&B once on the training machine:
+
+```bash
+pip install --upgrade --force-reinstall wandb
+wandb login
+```
+
+The `run_train.sh` example above enables both backends. Logged namespaces are `train/*`, `validation/*`, and `test/*`.
+
+Open TensorBoard in another shell on the training server:
+
+```bash
+tensorboard --logdir checkpoints/brainage_head/tensorboard --host 0.0.0.0 --port 6006
+```
+
+For a remote server, forward the port from the local machine:
+
+```bash
+ssh -L 6006:localhost:6006 user@training-server
+```
+
+Then open `http://localhost:6006`.
+
+For a compute node without internet, add `--wandb-mode offline`. After training, synchronize from a machine with network access using `wandb sync checkpoints/brainage_head/wandb/offline-run-*`. To continue the same W&B run, retain the training checkpoint and pass the original ID with `--wandb-run-id <run-id>` alongside `--resume`.
 
 ### 5. Inference
 
@@ -416,14 +520,13 @@ print(report)
 
 - **[BraTS 2020](https://www.kaggle.com/datasets/awsaf49/brats20-dataset-training-validation)**: 369 brain tumor MRI cases with clinical annotations from [TextBraTS 2021](https://github.com/Jupitern52/TextBraTS)
 - **Healthy Controls**: 99 preprocessed healthy brain scans (skull-stripped, normalized) from [MPI-Leipzig Mind-Brain-Body](https://openneuro.org/datasets/ds000221/versions/00002)
-- **Open-BHB Brain Age**: preprocessed brain MRI volumes with `age` labels in `train.tsv` and `test.tsv`, consumed by `braingemma3d_age_dataset.py` for chronological age regression.
+- **Open-BHB Brain Age**: 3,227 training and 757 held-out internal-test participants in the mounted dataset. Both `quasiraw_3d` and `vbm_3d` volumes are supported. The training TSV is split deterministically into 2,904 optimization and 323 validation participants with the default 10% validation fraction.
 
 ### Preprocessing
 
-1. **As-Closest-Canonical Orientation**: Align all volumes to RAS orientation
-2. **Axis Transposition**: Convert (H,W,D) → (D,H,W) for volumetric processing
-3. **Robust Normalization**: Percentile-based clipping (p1, p99) followed by min-max scaling
-4. **Trilinear Resizing**: Downsample to (64, 128, 128) for memory efficiency
+For report generation from NIfTI, volumes are canonicalized to RAS, converted to `(D,H,W)`, robustly normalized with p1/p99 clipping, and resized according to the report-generation configuration.
+
+For Open-BHB brain age, the registered `.npy` arrays are already `(D,H,W)`. They are checked for finite values, normalized independently with p1/p99 clipping, and resized to `(32,112,112)` by default. With depth kernel/stride 4 and a maximum of 8 depth patches, MedSigLIP receives 512 visual tokens per volume.
 
 ---
 
