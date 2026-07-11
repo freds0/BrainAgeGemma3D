@@ -329,6 +329,42 @@ def print_metrics(label, metrics):
     print(label + " | " + " | ".join(f"{key}={metrics[key]:.4f}" for key in fields))
 
 
+def print_epoch_summary(
+    epoch,
+    train_loss,
+    learning_rate,
+    elapsed,
+    metrics,
+    n_validation,
+    best_val_mae,
+    improved,
+    stale_epochs,
+    patience,
+):
+    status = "IMPROVED - saving best.pt" if improved else "no improvement"
+    print("\n" + "-" * 72)
+    print(f"EPOCH {epoch} SUMMARY")
+    print("-" * 72)
+    print(
+        f"Train      | loss={train_loss:.6f} | lr={learning_rate:.3e} "
+        f"| time={elapsed:.1f}s"
+    )
+    print(
+        f"Validation | n={n_validation} | MAE={metrics['mae']:.3f} yr "
+        f"| RMSE={metrics['rmse']:.3f} yr | R2={metrics['r2']:.4f}"
+    )
+    print(
+        f"Association| Pearson={metrics['pearson']:.4f} "
+        f"| Spearman={metrics['spearman']:.4f} "
+        f"| mean_delta={metrics['mean_delta']:+.3f} yr"
+    )
+    print(
+        f"Selection  | {status} | best_MAE={best_val_mae:.3f} yr "
+        f"| early_stop={stale_epochs}/{patience}"
+    )
+    print("-" * 72 + "\n")
+
+
 def print_subgroup_metrics(metrics):
     frame = pd.DataFrame(
         {
@@ -511,10 +547,6 @@ def train(args):
             )
 
         val_metrics = evaluate(model, val_loader, device, age_mean, age_std, amp_dtype)
-        print_metrics(
-            f"epoch={epoch} train_loss={running/max(seen, 1):.4f} time={time.perf_counter()-started:.1f}s val",
-            val_metrics,
-        )
         epoch_log = {"train/epoch_loss": running / max(seen, 1)}
         epoch_log.update(
             {
@@ -538,6 +570,18 @@ def train(args):
             )
         else:
             stale_epochs += 1
+        print_epoch_summary(
+            epoch=epoch,
+            train_loss=running / max(seen, 1),
+            learning_rate=scheduler.get_last_lr()[0],
+            elapsed=time.perf_counter() - started,
+            metrics=val_metrics,
+            n_validation=len(val_ds),
+            best_val_mae=best_val,
+            improved=improved,
+            stale_epochs=stale_epochs,
+            patience=args.patience,
+        )
         save_checkpoint(
             last_path,
             model,

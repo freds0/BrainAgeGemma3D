@@ -344,7 +344,7 @@ python braingemma3d_regression.py ... --stage lora --lr 1e-5
 
 `--stage full` is available but is not recommended on a 12 GB GPU. The default tubelet configuration produces 512 visual tokens instead of several thousand. Spatial positional embeddings are interpolated from pretrained MedSigLIP weights and combined with sinusoidal depth positions.
 
-Training uses AMP, gradient clipping, cosine decay with warmup, early stopping on validation MAE, and correct handling of partial gradient-accumulation groups. Ages are standardized using only the selected training subjects.
+Training uses AMP, gradient clipping, cosine decay with warmup, early stopping on validation MAE, and correct handling of partial gradient-accumulation groups. At the end of every epoch it prints a validation summary with MAE, RMSE, R2, Pearson, Spearman, mean brain-age delta, best-checkpoint status, and early-stopping progress. Ages are standardized using only the selected training subjects.
 
 Checkpoints:
 
