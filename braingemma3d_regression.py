@@ -400,6 +400,13 @@ def make_scheduler(optimizer, warmup_steps, total_steps):
 
 
 def train(args):
+    if args.batch_size > 16 and not args.allow_large_batch:
+        raise ValueError(
+            f"batch_size={args.batch_size} is unsafe for 3D attention. "
+            "Use --batch-size 1 (or a small tested value) and increase "
+            "--grad-accum for the effective batch. Pass --allow-large-batch "
+            "only after measuring GPU memory."
+        )
     set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if args.unfreeze_encoder:
@@ -592,6 +599,8 @@ def train(args):
             args,
             (age_mean, age_std),
         )
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
         if stale_epochs >= args.patience:
             print(f"[early-stop] no validation improvement for {stale_epochs} epochs")
             break
@@ -656,6 +665,11 @@ def build_argparser():
     parser.add_argument("--loss", choices=["l1", "mse"], default="l1")
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument(
+        "--allow-large-batch",
+        action="store_true",
+        help="Bypass the safety limit for batch sizes above 16",
+    )
     parser.add_argument("--grad-accum", type=int, default=8)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-2)

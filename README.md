@@ -324,7 +324,7 @@ python braingemma3d_regression.py \
     --wandb-run-name head-seed42
 ```
 
-Run it with `bash run_train.sh`. Replace `/root/Models/siglip` with `google/medsiglip-448` to download from Hugging Face when authentication and network access are available.
+Run it with `bash run_train.sh`. Replace `/root/Models/siglip` with `google/medsiglip-448` to download from Hugging Face when authentication and network access are available. `--batch-size` is the number of complete 3D volumes resident at once; use `--grad-accum` to increase the effective batch without multiplying attention memory.
 
 Available training stages:
 
@@ -380,6 +380,12 @@ ssh -L 6006:localhost:6006 user@training-server
 ```
 
 Then open `http://localhost:6006`.
+
+#### CUDA launch failures
+
+Do not use large image batches for 3D attention. For example, `--batch-size 512 --grad-accum 8` attempts 512 volumes concurrently and an effective batch of 4096; it can trigger a driver-level `cudaErrorLaunchFailure`. Start with `--batch-size 1 --grad-accum 8`. The trainer rejects batches above 16 unless `--allow-large-batch` is explicitly supplied.
+
+After a CUDA launch failure, start a new process and verify GPU access with `nvidia-smi` and `python -c "import torch; print(torch.cuda.is_available())"`. Resume the last completed epoch with `--resume checkpoints/brainage_head/last.pt`. The low Pearson or Spearman values describe model quality and are unrelated to the CUDA crash.
 
 For a compute node without internet, add `--wandb-mode offline`. After training, synchronize from a machine with network access using `wandb sync checkpoints/brainage_head/wandb/offline-run-*`. To continue the same W&B run, retain the training checkpoint and pass the original ID with `--wandb-run-id <run-id>` alongside `--resume`.
 
