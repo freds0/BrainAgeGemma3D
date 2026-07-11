@@ -11,9 +11,10 @@ Definition of the BrainGemma3D model architecture:
 
 # ENVIRONMENT CONFIGURATION
 import os
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
-os.environ['TRANSFORMERS_NO_TF'] = '1'
-os.environ['USE_TF'] = '0'
+
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+os.environ["TRANSFORMERS_NO_TF"] = "1"
+os.environ["USE_TF"] = "0"
 
 import numpy as np
 import nibabel as nib
@@ -49,13 +50,14 @@ def get_inference_prompt(user_prompt: str = None) -> str:
 # MODEL LOADERS (Local)
 # ============================================================
 
+
 def load_sigclip_local(sigclip_dir: str):
     """
     Load SigLIP/MedSigLIP from local directory.
-    
+
     Args:
         sigclip_dir: Path to SigLIP model directory
-        
+
     Returns:
         Loaded SigLIP model
     """
@@ -68,11 +70,11 @@ def load_sigclip_local(sigclip_dir: str):
 def load_medgemma_lm_local(medgemma_dir: str, device_map=None):
     """
     Load MedGemma CausalLM with 4-bit quantization.
-    
+
     Args:
         medgemma_dir: Path to MedGemma model directory
         device_map: Device mapping for model placement
-        
+
     Returns:
         Quantized MedGemma language model
     """
@@ -102,10 +104,10 @@ def load_medgemma_lm_local(medgemma_dir: str, device_map=None):
 def load_medgemma_tokenizer_local(medgemma_dir: str):
     """
     Load MedGemma tokenizer from local directory.
-    
+
     Args:
         medgemma_dir: Path to MedGemma model directory
-        
+
     Returns:
         MedGemma tokenizer
     """
@@ -119,29 +121,32 @@ def load_medgemma_tokenizer_local(medgemma_dir: str):
 # NIFTI LOADING / PREPROCESSING
 # ============================================================
 
-def load_nifti_volume(nifti_path: str, target_size: Tuple[int, int, int] = (64, 128, 128)) -> torch.Tensor:
+
+def load_nifti_volume(
+    nifti_path: str, target_size: Tuple[int, int, int] = (64, 128, 128)
+) -> torch.Tensor:
     """
     Load a NIfTI volume, normalize, and resize to target_size (D,H,W).
     Returns tensor (1,1,D,H,W) float32 on CPU.
 
-    Note: 
+    Note:
     - BraTS NIfTI files are saved as (H,W,D) after as_closest_canonical, so we transpose to (D,H,W)
     - HealthyBrains preprocessed NIfTI are already (D,H,W) but UPSIDE DOWN -> flip depth axis
-    
+
     Args:
         nifti_path: Path to NIfTI file
         target_size: Target dimensions (depth, height, width)
-        
+
     Returns:
         Volume tensor (1,1,D,H,W)
     """
     img = nib.load(nifti_path)
     img = nib.as_closest_canonical(img)
     vol = img.get_fdata(dtype=np.float32)
-    
+
     # DETECTION: HealthyBrains preprocessed vs BraTS original
     is_healthy = "HealthyBrains" in nifti_path or "healthy" in nifti_path.lower()
-    
+
     if is_healthy:
         # Healthy: already (D,H,W) but flip height axis
         vol = np.flip(vol, axis=1).copy()
@@ -205,7 +210,7 @@ def load_nifti_volume_general(
         nifti_path: Path to NIfTI file
         target_size: Target dimensions (depth, height, width)
         verbose: Whether to print detection details
-        
+
     Returns:
         Volume tensor (1,1,D,H,W) float32 on CPU
     """
@@ -275,8 +280,8 @@ def load_nifti_volume_general(
     # Within the two remaining axes, try to align to P-A (height) vs L-R (width)
     # using the orientation codes (1=A, 0=R) so coronal view makes sense.
     code_of = {int(ornt[a, 0]): a for a in spatial_axes}
-    ax_height = code_of.get(1, spatial_axes[0])   # A axis → height
-    ax_width  = code_of.get(0, spatial_axes[1])   # R axis → width
+    ax_height = code_of.get(1, spatial_axes[0])  # A axis → height
+    ax_width = code_of.get(0, spatial_axes[1])  # R axis → width
     # If the codes don't resolve (e.g. identity affine may have no code 1 in
     # the spatial_axes), just keep original order.
     if ax_height == ax_width:
@@ -307,12 +312,12 @@ def load_nifti_volume_general(
 def get_volume_from_ex(ex: Dict, target_size=(64, 128, 128), device=None):
     """
     Load the volume only when needed.
-    
+
     Args:
         ex: Example dictionary containing 'image_path'
         target_size: Target dimensions (depth, height, width)
         device: Target device (CPU if None)
-        
+
     Returns:
         Volume tensor (1,1,D,H,W) float32 on specified device
     """
@@ -326,18 +331,24 @@ def get_volume_from_ex(ex: Dict, target_size=(64, 128, 128), device=None):
 # MODEL ARCHITECTURE - 3D Vision Encoder
 # ============================================================
 
-def inflate_conv2d_to_conv3d(conv2d: nn.Conv2d, depth: int, in_channels_override=None) -> nn.Conv3d:
+
+def inflate_conv2d_to_conv3d(
+    conv2d: nn.Conv2d,
+    depth: int,
+    in_channels_override=None,
+    depth_stride: int = 1,
+) -> nn.Conv3d:
     """
     Inflate a Conv2D layer to Conv3D (kernel_depth = depth) by copying weights.
-    
+
     The 2D kernel is repeated along the depth dimension and averaged to preserve
     the magnitude of activations.
-    
+
     Args:
         conv2d: Source 2D convolution layer
         depth: Kernel size in the depth dimension
         in_channels_override: Override input channels (e.g., 1 for grayscale MRI vs 3 for RGB)
-        
+
     Returns:
         Inflated 3D convolution layer
     """
@@ -348,14 +359,16 @@ def inflate_conv2d_to_conv3d(conv2d: nn.Conv2d, depth: int, in_channels_override
     else:
         pad_h, pad_w = padding_2d
 
-    in_channels = in_channels_override if in_channels_override is not None else conv2d.in_channels
+    in_channels = (
+        in_channels_override if in_channels_override is not None else conv2d.in_channels
+    )
 
     conv3d = nn.Conv3d(
         in_channels=in_channels,
         out_channels=conv2d.out_channels,
         kernel_size=(depth, conv2d.kernel_size[0], conv2d.kernel_size[1]),
-        stride=(1, conv2d.stride[0], conv2d.stride[1]),
-        padding=(depth // 2, pad_h, pad_w),
+        stride=(depth_stride, conv2d.stride[0], conv2d.stride[1]),
+        padding=(0 if depth_stride > 1 else depth // 2, pad_h, pad_w),
         bias=(conv2d.bias is not None),
     )
 
@@ -364,10 +377,14 @@ def inflate_conv2d_to_conv3d(conv2d: nn.Conv2d, depth: int, in_channels_override
         # Repeat along depth dimension and average to preserve magnitude
         w3 = w2.unsqueeze(2).repeat(1, 1, depth, 1, 1) / depth  # (out, in, kd, kh, kw)
 
-        if in_channels_override is not None and in_channels_override != conv2d.in_channels:
+        if (
+            in_channels_override is not None
+            and in_channels_override != conv2d.in_channels
+        ):
             # Handle channel adaptation (e.g., 1-channel MRI from 3-channel RGB weights)
             if conv2d.in_channels == 3 and in_channels_override == 1:
-                w3 = w3.mean(dim=1, keepdim=True)
+                # Preserve the response obtained by replicating grayscale to RGB.
+                w3 = w3.sum(dim=1, keepdim=True)
             else:
                 raise ValueError("Channel override not generically handled.")
         conv3d.weight.copy_(w3)
@@ -383,13 +400,20 @@ class SiglipVisionTransformer3D(nn.Module):
     Adapt SigLIP/MedSigLIP vision_model to 3D inputs:
     - patch_embedding → patch_embedding_3d (inflated Conv3D)
     - 3D positional embedding (custom) as in the notebook
-    
+
     The model processes 3D volumes by:
     1. Extracting 3D patches via inflated convolution
     2. Adding learned 3D positional embeddings
     3. Processing through the original 2D transformer encoder
     """
-    def __init__(self, vision_model_2d, depth: int = 2, max_depth_patches: int = 128):
+
+    def __init__(
+        self,
+        vision_model_2d,
+        depth: int = 2,
+        depth_stride: int = 1,
+        max_depth_patches: int = 128,
+    ):
         """
         Args:
             vision_model_2d: Pre-trained 2D vision model (SigLIP/MedSigLIP)
@@ -403,7 +427,9 @@ class SiglipVisionTransformer3D(nn.Module):
 
         # Inflate 2D patch embedding to 3D
         pe2d = vision_model_2d.embeddings.patch_embedding
-        self.patch_embedding_3d = inflate_conv2d_to_conv3d(pe2d, depth=depth, in_channels_override=1)
+        self.patch_embedding_3d = inflate_conv2d_to_conv3d(
+            pe2d, depth=depth, in_channels_override=1, depth_stride=depth_stride
+        )
 
         # Reuse encoder and normalization layers from 2D model
         self.encoder = vision_model_2d.encoder
@@ -414,70 +440,85 @@ class SiglipVisionTransformer3D(nn.Module):
 
         # 2D positional embedding: (1, 1+N, E) often includes cls token
         # In MedSigLIP, cls token is not always used; we sum pos on patch tokens
-        self.pos_embed_2d = getattr(vision_model_2d.embeddings, "position_embedding", None)
+        self.pos_embed_2d = getattr(
+            vision_model_2d.embeddings, "position_embedding", None
+        )
 
-        # Cache for 3D positional embeddings
-        self._pos_cache = {}
-
-    def get_position_embedding_3d(self, Dp: int, num_spatial: int, Hp: int, Wp: int) -> torch.Tensor:
+    def get_position_embedding_3d(
+        self, Dp: int, num_spatial: int, Hp: int, Wp: int
+    ) -> torch.Tensor:
         """
         Create 3D position embedding (Dp * Hp*Wp, E).
         Follows notebook approach: pos = pos_depth + pos_spatial.
-        
+
         Args:
             Dp: Number of patches along depth
             num_spatial: Total number of spatial patches (Hp * Wp)
             Hp: Number of patches along height
             Wp: Number of patches along width
-            
+
         Returns:
             Position embedding tensor (1, N, E) where N = Dp * Hp * Wp
         """
-        key = (Dp, Hp, Wp, num_spatial, self.hidden_size)
-        if key in self._pos_cache:
-            return self._pos_cache[key]
+        device = self.patch_embedding_3d.weight.device
+        dtype = self.patch_embedding_3d.weight.dtype
 
-        # Depth positional encoding: (Dp, E)
-        pos_d = torch.linspace(-1, 1, steps=Dp).unsqueeze(1)  # (Dp, 1)
-        pos_d = pos_d.repeat(1, self.hidden_size)             # (Dp, E)
+        pos_weight = getattr(self.pos_embed_2d, "weight", None)
+        if pos_weight is not None:
+            side = int(round(pos_weight.shape[0] ** 0.5))
+            spatial = pos_weight[-(side * side) :].T.reshape(
+                1, self.hidden_size, side, side
+            )
+            spatial = F.interpolate(
+                spatial.float(), size=(Hp, Wp), mode="bicubic", align_corners=False
+            )
+            pos_s = (
+                spatial.to(device=device, dtype=dtype)
+                .flatten(2)
+                .transpose(1, 2)
+                .squeeze(0)
+            )
+        else:
+            pos_s = torch.zeros(Hp * Wp, self.hidden_size, device=device, dtype=dtype)
 
-        # Spatial positional encoding: (Hp*Wp, E)
-        ys = torch.linspace(-1, 1, steps=Hp)
-        xs = torch.linspace(-1, 1, steps=Wp)
-        grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
-        grid = torch.stack([grid_y, grid_x], dim=-1).reshape(-1, 2)  # (Hp*Wp, 2)
+        position = torch.arange(Dp, device=device, dtype=torch.float32).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, self.hidden_size, 2, device=device, dtype=torch.float32)
+            * (-np.log(10000.0) / self.hidden_size)
+        )
+        pos_d = torch.zeros(Dp, self.hidden_size, device=device, dtype=torch.float32)
+        pos_d[:, 0::2] = torch.sin(position * div_term)
+        odd_width = pos_d[:, 1::2].shape[1]
+        pos_d[:, 1::2] = torch.cos(position * div_term[:odd_width])
+        pos_d = pos_d.to(dtype=dtype)
 
-        # Simple lifting to embedding dimension
-        pos_s = torch.zeros((Hp * Wp, self.hidden_size))
-        pos_s[:, 0] = grid[:, 0]
-        if self.hidden_size > 1:
-            pos_s[:, 1] = grid[:, 1]
-
-        # Broadcast and sum: (Dp, 1, E) + (1, Hp*Wp, E) → (Dp, Hp*Wp, E)
         pos = pos_d.unsqueeze(1) + pos_s.unsqueeze(0)
-        pos = pos.reshape(Dp * Hp * Wp, self.hidden_size)  # (N, E)
-
-        pos = pos.unsqueeze(0)  # (1, N, E)
-        self._pos_cache[key] = pos
+        pos = pos.reshape(1, Dp * Hp * Wp, self.hidden_size)
         return pos
 
     def forward(self, x_3d: torch.Tensor) -> torch.Tensor:
         """
         Forward pass for 3D vision transformer.
-        
+
         Args:
             x_3d: Input volume (B, 1, D, H, W)
-            
+
         Returns:
             Encoded patch tokens (B, N, E) where N is number of 3D patches
         """
         # Extract 3D patches
-        x = self.patch_embedding_3d(x_3d)          # (B, E, D', H', W')
+        x = self.patch_embedding_3d(x_3d)  # (B, E, D', H', W')
+        if self.max_depth_patches and x.shape[2] > self.max_depth_patches:
+            x = F.adaptive_avg_pool3d(
+                x, (self.max_depth_patches, x.shape[3], x.shape[4])
+            )
         B, E, Dp, Hp, Wp = x.shape
-        x = x.flatten(2).transpose(1, 2)           # (B, N, E) where N = Dp * Hp * Wp
+        x = x.flatten(2).transpose(1, 2)  # (B, N, E) where N = Dp * Hp * Wp
 
         # Add 3D positional embedding
-        pos = self.get_position_embedding_3d(Dp, Hp * Wp, Hp, Wp).to(x.device, dtype=x.dtype)
+        pos = self.get_position_embedding_3d(Dp, Hp * Wp, Hp, Wp).to(
+            x.device, dtype=x.dtype
+        )
         x = x + pos
 
         # Process through transformer encoder
@@ -489,10 +530,17 @@ class SiglipVisionTransformer3D(nn.Module):
 class MedSigLIP3D(nn.Module):
     """
     Wrapper class: load base SigLIP/MedSigLIP (LOCAL) and create 3D vision transformer.
-    
+
     Maintains compatibility with the original 2D model structure while adding 3D capabilities.
     """
-    def __init__(self, model_name_or_dir: str, depth: int = 2, max_depth_patches: int = 128):
+
+    def __init__(
+        self,
+        model_name_or_dir: str,
+        depth: int = 2,
+        depth_stride: int = 1,
+        max_depth_patches: int = 128,
+    ):
         """
         Args:
             model_name_or_dir: Path to local SigLIP model directory
@@ -508,15 +556,20 @@ class MedSigLIP3D(nn.Module):
 
         # Create 3D vision model from 2D base
         vision_2d = base.vision_model
-        self.vision_model = SiglipVisionTransformer3D(vision_2d, depth=depth, max_depth_patches=max_depth_patches)
+        self.vision_model = SiglipVisionTransformer3D(
+            vision_2d,
+            depth=depth,
+            depth_stride=depth_stride,
+            max_depth_patches=max_depth_patches,
+        )
 
     def encode_image(self, x_3d: torch.Tensor) -> torch.Tensor:
         """
         Encode 3D image volume to patch tokens.
-        
+
         Args:
             x_3d: Input volume (B, 1, D, H, W)
-            
+
         Returns:
             Normalized patch tokens (B, N, E) as in SigLIP
         """
@@ -526,15 +579,16 @@ class MedSigLIP3D(nn.Module):
 class BrainGemma3D(nn.Module):
     """
     Complete system for Report Generation from 3D volumes.
-    
+
     Architecture:
     - Vision: MedSigLIP3D (inflated from 2D medical model)
     - Language: MedGemma CausalLM (quantized)
     - Projection: Linear layers to map vision features to language embedding space
-    
+
     The model concatenates vision tokens with text prompt embeddings and
     uses the language model to generate radiology reports.
     """
+
     def __init__(
         self,
         vision_model_dir: str,
@@ -564,7 +618,9 @@ class BrainGemma3D(nn.Module):
         self.vis_scale = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
 
         # Load language model and tokenizer (LOCAL)
-        self.language_model = load_medgemma_lm_local(language_model_dir, device_map=device_map)
+        self.language_model = load_medgemma_lm_local(
+            language_model_dir, device_map=device_map
+        )
         self.tokenizer = load_medgemma_tokenizer_local(language_model_dir)
 
         self.lm_device = next(self.language_model.parameters()).device
@@ -602,12 +658,18 @@ class BrainGemma3D(nn.Module):
         # Convert vision encoder to bfloat16 (CRITICAL: prevents type mismatch)
         print(f"[BrainGemma3D] Converting vision encoder to bfloat16...")
         with torch.no_grad():
-            self.vision_encoder.vision_model.patch_embedding_3d.weight.data = \
-                self.vision_encoder.vision_model.patch_embedding_3d.weight.data.to(torch.bfloat16)
+            self.vision_encoder.vision_model.patch_embedding_3d.weight.data = (
+                self.vision_encoder.vision_model.patch_embedding_3d.weight.data.to(
+                    torch.bfloat16
+                )
+            )
             if self.vision_encoder.vision_model.patch_embedding_3d.bias is not None:
-                self.vision_encoder.vision_model.patch_embedding_3d.bias.data = \
-                    self.vision_encoder.vision_model.patch_embedding_3d.bias.data.to(torch.bfloat16)
-        
+                self.vision_encoder.vision_model.patch_embedding_3d.bias.data = (
+                    self.vision_encoder.vision_model.patch_embedding_3d.bias.data.to(
+                        torch.bfloat16
+                    )
+                )
+
         self.vision_encoder = self.vision_encoder.to(dtype=torch.bfloat16)
         print(f"[BrainGemma3D] Vision encoder converted to bfloat16")
 
@@ -630,16 +692,16 @@ class BrainGemma3D(nn.Module):
     def encode_volume(self, volume_3d: torch.Tensor) -> torch.Tensor:
         """
         Encode 3D volume to vision tokens projected to language embedding space.
-        
+
         Process:
         1. Extract patch tokens via vision encoder
         2. Pool to fixed number of tokens via adaptive pooling
         3. Project to language embedding dimension
         4. Scale by learnable parameter
-        
+
         Args:
             volume_3d: Input volume (B, 1, D, H, W)
-            
+
         Returns:
             Vision tokens (B, K, H_lm) normalized/scaled for language model
         """
@@ -647,14 +709,14 @@ class BrainGemma3D(nn.Module):
 
         # Extract patch tokens (B, N, E_vision)
         patch_tokens = self.vision_encoder.encode_image(volume_3d)
-        
+
         # Pool to fixed number of vision tokens
-        x = patch_tokens.transpose(1, 2)                            # (B, E_vision, N)
+        x = patch_tokens.transpose(1, 2)  # (B, E_vision, N)
         x = F.adaptive_avg_pool1d(x, self.num_vision_tokens)
-        x = x.transpose(1, 2)                                       # (B, K, E_vision)
+        x = x.transpose(1, 2)  # (B, K, E_vision)
 
         # Project to language embedding space and scale
-        x = self.vision_projector(x.to(torch.bfloat16))             # (B, K, H_lm)
+        x = self.vision_projector(x.to(torch.bfloat16))  # (B, K, H_lm)
         x = x * self.vis_scale.to(x.dtype)
         return x
 
@@ -672,11 +734,11 @@ class BrainGemma3D(nn.Module):
     ) -> str:
         """
         Generate radiology report from 3D volume.
-        
+
         Concatenates [vision_tokens] + [prompt tokens] as inputs_embeds.
         Includes controls for repetitions/hallucinations via repetition_penalty
         and no_repeat_ngram_size.
-        
+
         Args:
             volume_3d: MRI volume (B, 1, D, H, W)
             prompt: Input prompt (None = use CANONICAL_PROMPT)
@@ -686,13 +748,13 @@ class BrainGemma3D(nn.Module):
             top_p: Nucleus sampling threshold
             repetition_penalty: Penalty for token repetition
             no_repeat_ngram_size: Prevent repetition of n-grams
-            
+
         Returns:
             Generated radiology report text
         """
         if prompt is None:
             prompt = CANONICAL_PROMPT
-        
+
         self.eval()
 
         if self.tokenizer.pad_token_id is None:
@@ -711,11 +773,15 @@ class BrainGemma3D(nn.Module):
         ).to(self.lm_device)
 
         # Get text embeddings
-        text_emb = self.language_model.get_input_embeddings()(tok.input_ids)  # (1, T, H)
+        text_emb = self.language_model.get_input_embeddings()(
+            tok.input_ids
+        )  # (1, T, H)
 
         # Concatenate vision and text embeddings
         inputs_embeds = torch.cat([vis, text_emb], dim=1)  # (1, K+T, H)
-        attn = torch.ones(inputs_embeds.shape[:2], device=self.lm_device, dtype=torch.long)
+        attn = torch.ones(
+            inputs_embeds.shape[:2], device=self.lm_device, dtype=torch.long
+        )
 
         # Generate report
         out_ids = self.language_model.generate(

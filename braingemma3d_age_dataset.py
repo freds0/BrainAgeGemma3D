@@ -1,29 +1,8 @@
 #!/usr/bin/env python3
-"""
-Open-BHB Brain-Age Dataset
-==========================
-torch Dataset for the pre-processed Open-BHB volumes used for brain-age
-regression.
+"""Open-BHB dataset utilities for BrainGemma3D age regression."""
 
-Directory layout (read-only):
-    <root>/
-      train.tsv                 participant_id, age, sex, site, ...
-      test.tsv
-      train/quasiraw_3d/<id>_quasiraw_3d.npy   (182,218,182) float32
-      train/vbm_3d/<id>_vbm_3d.npy             (121,145,121) float32
-      test/...
-
-The volumes are already skull-stripped / registered numpy arrays, so unlike
-``load_nifti_volume`` in braingemma3d_architecture.py there is no NIfTI
-orientation handling here: we only robust-normalize and resize.
-
-The regression target is ``age`` (years). Optionally z-scored with
-``age_mean``/``age_std`` computed on the train split for stable MSE training;
-de-normalize predictions before reporting MAE in years.
-"""
-
-import os
 from pathlib import Path
+from typing import Iterable, Optional
 
 import numpy as np
 import pandas as pd
@@ -33,103 +12,161 @@ from torch.utils.data import Dataset
 
 
 def _robust_normalize(vol: np.ndarray) -> np.ndarray:
-    """Scale to [0,1] using the 1st-99th percentile range (per volume)."""
-    vmin, vmax = np.percentile(vol, 1), np.percentile(vol, 99)
-    if vmax > vmin:
-        return np.clip((vol - vmin) / (vmax - vmin), 0.0, 1.0)
-    return np.zeros_like(vol)
+    """Scale a finite volume to [0, 1] using its 1st-99th percentiles."""
+    if vol.ndim != 3:
+        raise ValueError(f"Expected a 3D volume, got shape={vol.shape}")
+    if not np.isfinite(vol).all():
+        raise ValueError("Volume contains NaN or infinite values")
+    vmin, vmax = np.percentile(vol, (1, 99))
+    if vmax <= vmin:
+        return np.zeros_like(vol, dtype=np.float32)
+    return np.clip((vol - vmin) / (vmax - vmin), 0.0, 1.0).astype(np.float32)
 
 
 class OpenBHBAgeDataset(Dataset):
-    """Maps a pre-processed Open-BHB volume to its subject age."""
+    """Map preprocessed Open-BHB volumes to normalized ages and metadata."""
 
     def __init__(
         self,
         root: str,
         split: str = "train",
         modality: str = "quasiraw_3d",
-        target_size=(64, 128, 128),
-        age_mean: float = None,
-        age_std: float = None,
+        target_size=(32, 112, 112),
+        age_mean: Optional[float] = None,
+        age_std: Optional[float] = None,
+        participant_ids: Optional[Iterable[str]] = None,
+        return_metadata: bool = False,
     ):
-        """
-        Args:
-            root: Dataset root (contains train.tsv/test.tsv and split dirs).
-            split: "train" or "test".
-            modality: "quasiraw_3d" (default) or "vbm_3d".
-            target_size: (D,H,W) the volume is trilinearly resized to.
-            age_mean, age_std: if both given, targets are z-scored.
-        """
-        self.dir = Path(root) / split / modality
+        self.root = Path(root)
+        self.split = split
+        self.modality = modality
+        self.dir = self.root / split / modality
         self.suffix = f"_{modality}.npy"
         self.target_size = tuple(target_size)
         self.age_mean = age_mean
         self.age_std = age_std
+        self.return_metadata = return_metadata
 
-        tsv = Path(root) / f"{split}.tsv"
-        if not tsv.exists():
-            raise FileNotFoundError(f"Label file not found: {tsv}")
+        if age_std is not None and (not np.isfinite(age_std) or age_std <= 0):
+            raise ValueError(f"age_std must be positive and finite, got {age_std}")
         if not self.dir.is_dir():
             raise FileNotFoundError(f"Volume directory not found: {self.dir}")
 
-        df = pd.read_csv(tsv, sep="\t", dtype={"participant_id": str})
-        # Keep only subjects whose .npy actually exists on disk.
-        have = df["participant_id"].map(
-            lambda p: (self.dir / f"{p}{self.suffix}").exists()
-        )
-        df = df[have].reset_index(drop=True)
-        if len(df) == 0:
+        df = self.load_metadata(root, split, modality)
+        if participant_ids is not None:
+            wanted = {str(value) for value in participant_ids}
+            df = df[df["participant_id"].isin(wanted)]
+            missing = wanted.difference(df["participant_id"])
+            if missing:
+                raise ValueError(
+                    f"{len(missing)} requested participants have no matching volume"
+                )
+        if df.empty:
             raise RuntimeError(f"No volumes matched labels in {self.dir}")
 
-        self.ids = df["participant_id"].tolist()
-        self.ages = df["age"].astype("float32").tolist()
-
-        n_missing = int((~have).sum())
-        if n_missing:
-            print(f"[OpenBHBAgeDataset] {split}/{modality}: "
-                  f"{len(self.ids)} volumes ({n_missing} labels had no .npy)")
+        self.frame = df.reset_index(drop=True)
+        self.ids = self.frame["participant_id"].tolist()
+        self.ages = self.frame["age"].astype("float32").tolist()
 
     @staticmethod
-    def compute_age_stats(root: str, split: str = "train"):
-        """Return (mean, std) of age over a split's label file."""
-        df = pd.read_csv(Path(root) / f"{split}.tsv", sep="\t")
-        ages = df["age"].astype("float32").to_numpy()
-        return float(ages.mean()), float(ages.std())
+    def load_metadata(root: str, split: str, modality: str) -> pd.DataFrame:
+        """Load valid, unique labels having a corresponding volume on disk."""
+        root = Path(root)
+        tsv = root / f"{split}.tsv"
+        volume_dir = root / split / modality
+        if not tsv.exists():
+            raise FileNotFoundError(f"Label file not found: {tsv}")
+        if not volume_dir.is_dir():
+            raise FileNotFoundError(f"Volume directory not found: {volume_dir}")
 
-    def __len__(self) -> int:
-        return len(self.ids)
+        df = pd.read_csv(tsv, sep="\t", dtype={"participant_id": str})
+        required = {"participant_id", "age"}
+        missing_columns = required.difference(df.columns)
+        if missing_columns:
+            raise ValueError(f"Missing TSV columns: {sorted(missing_columns)}")
+        if df["participant_id"].duplicated().any():
+            raise ValueError(f"Duplicate participant IDs in {tsv}")
+        df["age"] = pd.to_numeric(df["age"], errors="coerce")
+        if not np.isfinite(df["age"]).all():
+            raise ValueError(f"Missing or non-finite ages in {tsv}")
 
-    def __getitem__(self, i: int):
-        path = self.dir / f"{self.ids[i]}{self.suffix}"
-        vol = np.load(path).astype(np.float32)              # (D,H,W)
-        vol = _robust_normalize(vol)
-
-        vol_t = torch.from_numpy(vol).unsqueeze(0).unsqueeze(0)  # (1,1,D,H,W)
-        vol_t = F.interpolate(
-            vol_t, size=self.target_size, mode="trilinear", align_corners=False
+        suffix = f"_{modality}.npy"
+        have = df["participant_id"].map(
+            lambda p: (volume_dir / f"{p}{suffix}").exists()
         )
-        vol_t = vol_t.squeeze(0).contiguous()                # (1,D,H,W)
+        if (~have).any():
+            print(
+                f"[OpenBHBAgeDataset] {split}/{modality}: dropping {(~have).sum()} missing volumes"
+            )
+        return df[have].reset_index(drop=True)
 
-        age = float(self.ages[i])
-        if self.age_mean is not None and self.age_std:
-            age = (age - self.age_mean) / self.age_std
-        return vol_t, torch.tensor(age, dtype=torch.float32)
+    @staticmethod
+    def compute_age_stats(
+        root: str,
+        split: str = "train",
+        modality: str = "quasiraw_3d",
+        participant_ids: Optional[Iterable[str]] = None,
+    ):
+        """Return population mean/std over the actual selected training volumes."""
+        df = OpenBHBAgeDataset.load_metadata(root, split, modality)
+        if participant_ids is not None:
+            wanted = {str(value) for value in participant_ids}
+            df = df[df["participant_id"].isin(wanted)]
+        ages = df["age"].to_numpy(dtype=np.float32)
+        if not len(ages):
+            raise ValueError("Cannot compute age statistics on an empty subset")
+        std = float(ages.std(ddof=0))
+        if std <= 0 or not np.isfinite(std):
+            raise ValueError(f"Invalid age standard deviation: {std}")
+        return float(ages.mean()), std
+
+    def __len__(self):
+        return len(self.frame)
+
+    def __getitem__(self, index):
+        row = self.frame.iloc[index]
+        path = self.dir / f"{row.participant_id}{self.suffix}"
+        vol = _robust_normalize(np.load(path).astype(np.float32, copy=False))
+        vol_t = torch.from_numpy(vol)[None, None]
+        vol_t = (
+            F.interpolate(
+                vol_t, size=self.target_size, mode="trilinear", align_corners=False
+            )
+            .squeeze(0)
+            .contiguous()
+        )
+
+        age = float(row.age)
+        target = age
+        if self.age_mean is not None and self.age_std is not None:
+            target = (age - self.age_mean) / self.age_std
+        target_t = torch.tensor(target, dtype=torch.float32)
+        if not self.return_metadata:
+            return vol_t, target_t
+        metadata = {
+            "participant_id": str(row.participant_id),
+            "age_years": age,
+            "sex": str(row.get("sex", "unknown")),
+            "site": str(row.get("site", "unknown")),
+        }
+        return vol_t, target_t, metadata
 
 
 if __name__ == "__main__":
-    # Quick self-test against the real dataset.
     import argparse
 
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--root", default="/media/fred/FRED5TB/Einstein/Open_BHB_processado")
-    ap.add_argument("--modality", default="quasiraw_3d")
-    ap.add_argument("--split", default="train")
-    args = ap.parse_args()
-
-    mean, std = OpenBHBAgeDataset.compute_age_stats(args.root, "train")
-    ds = OpenBHBAgeDataset(args.root, args.split, args.modality,
-                           age_mean=mean, age_std=std)
-    vol, age = ds[0]
-    print(f"dataset size={len(ds)} | age_mean={mean:.2f} age_std={std:.2f}")
-    print(f"sample vol={tuple(vol.shape)} dtype={vol.dtype} "
-          f"range=[{vol.min():.3f},{vol.max():.3f}] | age_norm={age.item():.3f}")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--root", required=True)
+    parser.add_argument("--modality", default="quasiraw_3d")
+    parser.add_argument("--split", default="train")
+    args = parser.parse_args()
+    mean, std = OpenBHBAgeDataset.compute_age_stats(args.root, "train", args.modality)
+    dataset = OpenBHBAgeDataset(
+        args.root, args.split, args.modality, age_mean=mean, age_std=std
+    )
+    volume, age = dataset[0]
+    print(f"size={len(dataset)} mean={mean:.2f} std={std:.2f}")
+    print(
+        f"volume={tuple(volume.shape)} range=[{volume.min():.3f}, {volume.max():.3f}]"
+    )
+    print(f"normalized_age={age.item():.3f}")

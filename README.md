@@ -231,27 +231,9 @@ python braingemma3d_training.py \
 
 ### 4. Brain Age Prediction Training
 
-For brain age prediction, use `braingemma3d_regression.py`. This path is a pure image-regression setup: it keeps the 3D MedSigLIP encoder from BrainGemma3D, removes the MedGemma language model, and trains a small MLP head that predicts chronological age.
+The brain-age path uses only the inflated 3D MedSigLIP encoder and an MLP regression head. The original `test.tsv` is held out and evaluated once after model selection. A deterministic 90/10 train-validation split is stratified by site, age band, and sex.
 
-Expected Open-BHB layout:
-
-```text
-/path/to/Open_BHB_processado/
-├── train.tsv                         # participant_id, age, sex, site, ...
-├── test.tsv
-├── train/
-│   ├── quasiraw_3d/
-│   │   └── <participant_id>_quasiraw_3d.npy
-│   └── vbm_3d/
-│       └── <participant_id>_vbm_3d.npy
-└── test/
-    ├── quasiraw_3d/
-    │   └── <participant_id>_quasiraw_3d.npy
-    └── vbm_3d/
-        └── <participant_id>_vbm_3d.npy
-```
-
-Run a quick dataset check:
+Run a dataset check:
 
 ```bash
 python braingemma3d_age_dataset.py \
@@ -260,71 +242,42 @@ python braingemma3d_age_dataset.py \
     --split train
 ```
 
-Train the default brain-age regressor:
+Train the memory-safe head-only baseline (recommended first run for a 12 GB GPU):
 
 ```bash
 python braingemma3d_regression.py \
     --root /path/to/Open_BHB_processado \
     --vision-model-dir google/medsiglip-448 \
-    --modality quasiraw_3d \
-    --target-size 64 128 128 \
-    --output-dir checkpoints/brainage \
-    --epochs 30 \
-    --batch-size 4 \
-    --lr 1e-3 \
-    --loss l1
+    --stage head \
+    --target-size 32 112 112 \
+    --depth 4 --depth-stride 4 --max-depth-patches 8 \
+    --batch-size 1 --grad-accum 8 \
+    --output-dir checkpoints/brainage_head
 ```
 
-`--vision-model-dir` can be either a local MedSigLIP/SigLIP directory or a Hugging Face Hub id such as `google/medsiglip-448`. If you use the Hub id, log in first and accept the gated model license:
+After validating the baseline, adapt the inflated stem or add LoRA adapters:
 
 ```bash
-huggingface-cli login
+# Train the 3D patch stem and head
+python braingemma3d_regression.py ... --stage stem --lr 1e-5
+
+# Train the stem, head, and q/v LoRA adapters
+python braingemma3d_regression.py ... --stage lora --lr 1e-5
 ```
 
-Default trainability:
+`--stage full` is available but is not recommended on a 12 GB GPU. The default tubelet configuration produces 512 visual tokens instead of several thousand. Spatial positional embeddings are interpolated from pretrained MedSigLIP weights and combined with sinusoidal depth positions.
 
-- The SigLIP transformer is frozen.
-- The inflated 3D patch embedding stem remains trainable.
-- The MLP regression head is always trainable.
-- Ages are z-scored using the training split and MAE is reported in years on the test split after each epoch.
+Training uses AMP, gradient clipping, cosine decay with warmup, early stopping on validation MAE, and correct handling of partial gradient-accumulation groups. Ages are standardized using only the selected training subjects.
 
-Useful variants:
-
-```bash
-# Add LoRA adapters to the vision transformer attention blocks
-python braingemma3d_regression.py \
-    --root /path/to/Open_BHB_processado \
-    --vision-model-dir /path/to/Models/siglip \
-    --use-lora \
-    --lora-r 8 \
-    --lora-alpha 16 \
-    --output-dir checkpoints/brainage_lora
-
-# Fine-tune the full 3D vision encoder
-python braingemma3d_regression.py \
-    --root /path/to/Open_BHB_processado \
-    --vision-model-dir /path/to/Models/siglip \
-    --unfreeze-encoder \
-    --batch-size 1 \
-    --grad-accum 4 \
-    --lr 1e-5 \
-    --output-dir checkpoints/brainage_full
-
-# Resume from a saved regressor checkpoint
-python braingemma3d_regression.py \
-    --root /path/to/Open_BHB_processado \
-    --vision-model-dir /path/to/Models/siglip \
-    --resume checkpoints/brainage/regressor.pt \
-    --output-dir checkpoints/brainage_resumed
-```
-
-The best checkpoint is saved as:
+Checkpoints:
 
 ```text
-checkpoints/brainage/regressor.pt
+checkpoints/brainage_head/best.pt         # selected by validation MAE
+checkpoints/brainage_head/last.pt         # resumable latest epoch
+checkpoints/brainage_head/test_metrics.json
 ```
 
-The checkpoint stores the trainable tensors only: regression head, 3D patch stem, optional LoRA adapters, plus `age_mean`, `age_std`, best epoch, and best test MAE.
+Resume with `--resume checkpoints/brainage_head/last.pt`. The checkpoint includes model, optimizer, scheduler, RNG state, normalization statistics, epoch, and arguments. Test metrics include MAE, RMSE, R2, Pearson, Spearman, mean brain-age delta, and subgroup summaries.
 
 ### 5. Inference
 
